@@ -51,6 +51,10 @@ fn main() {
     // Wait for user process to exit ...
     let exit_code = user_task.join();
     ax_println!("monolithic kernel exit [{:?}] normally!", exit_code);
+    ax_println!("[SysMap]: ok!");
+
+    // Shut QEMU down so that the test script terminates deterministically.
+    axhal::misc::terminate();
 }
 
 fn init_user_stack(uspace: &mut AddrSpace, populating: bool) -> io::Result<VirtAddr> {

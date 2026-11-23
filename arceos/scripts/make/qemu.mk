@@ -1,6 +1,9 @@
 # QEMU arguments
 
 QEMU := qemu-system-$(ARCH)
+# Optional QEMU CPU model/features, e.g. QEMU_CPU="rv64,h=true" for the
+# hypervisor exercise.  Empty means the QEMU default CPU.
+QEMU_CPU ?=
 
 ifeq ($(BUS), mmio)
   vdev-suffix := device
@@ -24,7 +27,9 @@ qemu_args-aarch64 := \
   -machine virt \
   -kernel $(OUT_BIN)
 
-qemu_args-y := -m 128M -smp $(SMP) $(qemu_args-$(ARCH))
+qemu_args-y := -m 128M -smp $(SMP) \
+  $(if $(strip $(QEMU_CPU)),-cpu $(QEMU_CPU)) \
+  $(qemu_args-$(ARCH))
 
 qemu_args-$(PFLASH) += \
   -drive if=pflash,file=$(CURDIR)/$(PFLASH_IMG),format=raw,unit=1

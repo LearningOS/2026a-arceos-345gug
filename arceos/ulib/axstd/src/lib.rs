@@ -55,7 +55,25 @@ extern crate alloc;
 
 #[cfg(feature = "alloc")]
 #[doc(no_inline)]
-pub use alloc::{boxed, collections, format, string, vec};
+pub use alloc::{boxed, format, string, vec};
+
+/// Collection types.
+///
+/// In addition to the `alloc` collections (`VecDeque`, `BTreeMap`, ...), the
+/// crate provides hash-based containers.  `hashbrown` is `no_std` compatible
+/// and its default hasher (foldhash's `RandomState`) only needs `core`.
+#[cfg(feature = "alloc")]
+pub mod collections {
+    pub use alloc::collections::*;
+    pub use hashbrown::{HashMap, HashSet};
+
+    pub mod hash_map {
+        pub use hashbrown::hash_map::*;
+    }
+    pub mod hash_set {
+        pub use hashbrown::hash_set::*;
+    }
+}
 
 #[doc(no_inline)]
 pub use core::{arch, cell, cmp, hint, marker, mem, ops, ptr, slice, str};

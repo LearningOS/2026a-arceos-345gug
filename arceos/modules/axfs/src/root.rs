@@ -70,14 +70,12 @@ impl RootDirectory {
         self.mounts.iter().any(|mp| mp.path == path)
     }
 
-    fn lookup_mounted_fs<F, T>(&self, path: &str, f: F) -> AxResult<T>
-    where
-        F: FnOnce(Arc<dyn VfsOps>, &str) -> AxResult<T>,
-    {
-        debug!("lookup at root: {}", path);
-        let path = path.trim_matches('/');
-        if let Some(rest) = path.strip_prefix("./") {
-            return self.lookup_mounted_fs(rest, f);
+    /// Resolves `path` to the filesystem that should serve it and returns the
+    /// path relative to that filesystem's root.
+    fn resolve_fs(&self, path: &str) -> (Arc<dyn VfsOps>, String) {
+        let mut path = path.trim_matches('/');
+        while let Some(rest) = path.strip_prefix("./") {
+            path = rest;
         }
 
         let mut idx = 0;
@@ -94,10 +92,19 @@ impl RootDirectory {
         }
 
         if max_len == 0 {
-            f(self.main_fs.clone(), path) // not matched any mount point
+            (self.main_fs.clone(), String::from(path)) // not matched any mount point
         } else {
-            f(self.mounts[idx].fs.clone(), &path[max_len..]) // matched at `idx`
+            (self.mounts[idx].fs.clone(), String::from(&path[max_len..])) // matched at `idx`
         }
+    }
+
+    fn lookup_mounted_fs<F, T>(&self, path: &str, f: F) -> AxResult<T>
+    where
+        F: FnOnce(Arc<dyn VfsOps>, &str) -> AxResult<T>,
+    {
+        debug!("lookup at root: {}", path);
+        let (fs, rest) = self.resolve_fs(path);
+        f(fs, &rest)
     }
 }
 
@@ -133,13 +140,16 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
-            }
-        })
+        let (src_fs, src_rest) = self.resolve_fs(src_path);
+        let (dst_fs, dst_rest) = self.resolve_fs(dst_path);
+
+        if !Arc::ptr_eq(&src_fs, &dst_fs) {
+            return ax_err!(PermissionDenied, "cannot rename across filesystems");
+        }
+        if src_rest.is_empty() || dst_rest.is_empty() {
+            return ax_err!(PermissionDenied); // cannot rename mount points
+        }
+        src_fs.root_dir().rename(&src_rest, &dst_rest)
     }
 }
 

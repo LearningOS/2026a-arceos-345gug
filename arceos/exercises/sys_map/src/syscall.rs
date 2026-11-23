@@ -1,13 +1,16 @@
 #![allow(dead_code)]
 
 use core::ffi::{c_void, c_char, c_int};
+use alloc::vec;
 use axhal::arch::TrapFrame;
 use axhal::trap::{register_trap_handler, SYSCALL};
 use axerrno::LinuxError;
 use axtask::current;
 use axtask::TaskExtRef;
+use axhal::mem::{MemoryAddr, VirtAddr};
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
+use memory_addr::{VirtAddrRange, PAGE_SIZE_4K};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -131,6 +134,19 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
+/// Default hint for `mmap` when the caller passes a NULL address.
+///
+/// It is well above the typical ELF load address (0x10000) and well below the
+/// user stack (the top of the address space), which leaves enough room for
+/// both file-backed and anonymous mappings.
+const MMAP_BASE: usize = 0x2000_0000;
+
+/// Converts an ArceOS error into the negative errno value expected by Linux
+/// user programs.
+fn errno(e: axerrno::AxError) -> isize {
+    -(LinuxError::from(e).code() as isize)
+}
+
 #[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
@@ -138,9 +154,125 @@ fn sys_mmap(
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    ax_println!(
+        "sys_mmap: addr={:#x}, len={:#x}, prot={:#x}, flags={:#x}, fd={}, off={:#x}",
+        addr as usize,
+        length,
+        prot,
+        flags,
+        fd,
+        offset
+    );
+
+    let Some(prot) = MmapProt::from_bits(prot) else {
+        return -LinuxError::EINVAL.code() as isize;
+    };
+    let Some(flags) = MmapFlags::from_bits(flags) else {
+        return -LinuxError::EINVAL.code() as isize;
+    };
+    if length == 0 {
+        return -LinuxError::EINVAL.code() as isize;
+    }
+    // The mapping always covers whole pages.
+    let Some(size) = length
+        .checked_add(PAGE_SIZE_4K - 1)
+        .map(|len| len & !(PAGE_SIZE_4K - 1))
+    else {
+        return -LinuxError::ENOMEM.code() as isize;
+    };
+
+    let curr = current();
+    let aspace = curr.task_ext().aspace.clone();
+    let mut aspace = aspace.lock();
+
+    let req_addr = addr as usize;
+    let hint = if req_addr != 0 {
+        VirtAddr::from_usize(req_addr).align_down_4k()
+    } else {
+        VirtAddr::from_usize(MMAP_BASE)
+    };
+    let vaddr = if flags.contains(MmapFlags::MAP_FIXED) {
+        if req_addr == 0 || !aspace.contains_range(hint, size) {
+            return -LinuxError::EINVAL.code() as isize;
+        }
+        hint
+    } else {
+        let limit = VirtAddrRange::from_start_size(aspace.base(), aspace.size());
+        match aspace.find_free_area(hint, size, limit) {
+            Some(vaddr) => vaddr,
+            None => return -LinuxError::ENOMEM.code() as isize,
+        }
+    };
+
+    let anonymous = flags.contains(MmapFlags::MAP_ANONYMOUS) || fd < 0;
+    if anonymous {
+        // Anonymous mapping: populate zero pages directly in the user address
+        // space with the requested permissions.
+        let mut map_flags = MappingFlags::from(prot);
+        if !map_flags.contains(MappingFlags::READ) {
+            // RISC-V leaf PTEs must have R=1 (W=1,R=0 is reserved) and a PTE
+            // without any permission would be interpreted as a pointer to the
+            // next level.  Keep READ for all valid mappings.
+            map_flags |= MappingFlags::READ;
+        }
+        if let Err(e) = aspace.map_alloc(vaddr, size, map_flags, true) {
+            return errno(e);
+        }
+        ax_println!("sys_mmap: anonymous map at {:#x}", vaddr);
+        return vaddr.as_usize() as isize;
+    }
+
+    // File-backed, private mapping.  First map writable pages so that the
+    // kernel can copy the file contents in, then drop WRITE if the user did
+    // not ask for it.
+    if let Err(e) = aspace.map_alloc(
+        vaddr,
+        size,
+        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+        true,
+    ) {
+        return errno(e);
+    }
+
+    // Seek to the requested file offset before reading.
+    let seek_ret = api::sys_lseek(fd, offset as _, 0);
+    if seek_ret < 0 {
+        let _ = aspace.unmap(vaddr, size);
+        return seek_ret as isize;
+    }
+
+    // Read the file into kernel memory.  `sys_read` only produces a slice for
+    // the file backend, so using a kernel buffer avoids relying on user page
+    // permissions during the copy.
+    let mut buf = vec![0u8; size];
+    let n = api::sys_read(fd, buf.as_mut_ptr() as *mut c_void, size);
+    if n < 0 {
+        let _ = aspace.unmap(vaddr, size);
+        return n;
+    }
+    if let Err(e) = aspace.write(vaddr, &buf[..n as usize]) {
+        let _ = aspace.unmap(vaddr, size);
+        return errno(e);
+    }
+
+    // Apply the final protection (e.g. make the page read-only).
+    let mut final_flags = MappingFlags::from(prot);
+    if !final_flags.contains(MappingFlags::READ) {
+        final_flags |= MappingFlags::READ;
+    }
+    if let Err(e) = aspace.protect(vaddr, size, final_flags) {
+        let _ = aspace.unmap(vaddr, size);
+        return errno(e);
+    }
+
+    ax_println!(
+        "sys_mmap: file map at {:#x}, copied {} byte(s)",
+        vaddr,
+        n
+    );
+    vaddr.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

@@ -80,3 +80,7 @@ arceos_api = { workspace = true }
 axio = "0.1"
 axerrno = "0.1"
 kspin = "0.1"
+# A no_std hash table used to provide `collections::HashMap`/`HashSet`.
+# `default-hasher` pulls in foldhash's `RandomState`, which works without
+# `std` and also in bare-metal targets.
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }

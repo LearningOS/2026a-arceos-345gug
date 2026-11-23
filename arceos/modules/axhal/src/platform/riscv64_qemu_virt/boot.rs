@@ -20,7 +20,17 @@ unsafe fn init_mmu() {
     satp::set(satp::Mode::Sv39, 0, page_table_root >> 12);
     riscv::asm::sfence_vma_all();
 }
+use crate::console::putchar;
 
+unsafe fn console_putchar() {
+    putchar(10); // 打印换行符
+    putchar(72); // 打印"H“
+    putchar(69); // 打印"E“
+    putchar(76); // 打印"L“
+    putchar(76); // 打印"L“
+    putchar(79); // 打印"O“
+                 // 下面可以输出任何想要的内容， 只需更改参数即可
+}
 /// The earliest entry point for the primary CPU.
 #[naked]
 #[no_mangle]
@@ -35,8 +45,8 @@ unsafe extern "C" fn _start() -> ! {
         la      sp, {boot_stack}
         li      t0, {boot_stack_size}
         add     sp, sp, t0              // setup boot stack
-
         call    {init_boot_page_table}
+        call    {console_putchar}
         call    {init_mmu}              // setup boot page table and enabel MMU
 
         li      s2, {phys_virt_offset}  // fix up virtual high address
@@ -50,6 +60,7 @@ unsafe extern "C" fn _start() -> ! {
         j       .",
         phys_virt_offset = const PHYS_VIRT_OFFSET,
         boot_stack_size = const TASK_STACK_SIZE,
+        console_putchar = sym console_putchar,
         boot_stack = sym BOOT_STACK,
         init_boot_page_table = sym init_boot_page_table,
         init_mmu = sym init_mmu,

@@ -67,6 +67,50 @@ impl DirNode {
         children.remove(name);
         Ok(())
     }
+
+    /// Returns the `Arc` of this directory node.
+    fn this_arc(&self) -> VfsResult<Arc<DirNode>> {
+        self.this.upgrade().ok_or(VfsError::NotFound)
+    }
+
+    /// Resolves `path` to a directory node.
+    ///
+    /// `self` is the directory on which `rename` was invoked.  For a mounted
+    /// filesystem this is its root, so both absolute and relative paths are
+    /// resolved from `self`.  Walking `parent()` must be avoided: for a mounted
+    /// root it points into the parent filesystem.
+    fn resolve_dir(&self, path: &str) -> VfsResult<Arc<DirNode>> {
+        let base = self.this_arc()?;
+        let rel = path.strip_prefix('/').unwrap_or(path);
+        let rel = rel.trim_matches('/');
+        if rel.is_empty() {
+            return Ok(base);
+        }
+        let node = base.lookup(rel)?;
+        let dir = node
+            .as_any()
+            .downcast_ref::<DirNode>()
+            .ok_or(VfsError::NotADirectory)?;
+        dir.this_arc()
+    }
+
+    /// Splits `path` into its parent directory and its final component.
+    fn dir_and_name(&self, path: &str) -> VfsResult<(Arc<DirNode>, String)> {
+        let path = path.trim_end_matches('/');
+        let (dir_path, name) = match path.rfind('/') {
+            Some(idx) => (&path[..idx], &path[idx + 1..]),
+            None => ("", path),
+        };
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(VfsError::InvalidInput);
+        }
+        let dir = if path.starts_with('/') || !dir_path.is_empty() {
+            self.resolve_dir(dir_path)?
+        } else {
+            self.this_arc()?
+        };
+        Ok((dir, String::from(name)))
+    }
 }
 
 impl VfsNodeOps for DirNode {
@@ -163,6 +207,36 @@ impl VfsNodeOps for DirNode {
         } else {
             self.remove_node(name)
         }
+    }
+
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        log::debug!("rename at ramfs: {} -> {}", src_path, dst_path);
+        let (src_dir, src_name) = self.dir_and_name(src_path)?;
+        let (dst_dir, dst_name) = self.dir_and_name(dst_path)?;
+
+        // Moving a node to another directory is intentionally unsupported:
+        // only a rename inside the same directory is implemented.
+        if !Arc::ptr_eq(&src_dir, &dst_dir) {
+            return Err(VfsError::Unsupported);
+        }
+        if src_name == dst_name {
+            return Ok(());
+        }
+
+        let node = src_dir
+            .children
+            .read()
+            .get(&src_name)
+            .cloned()
+            .ok_or(VfsError::NotFound)?;
+
+        let mut children = src_dir.children.write();
+        if children.contains_key(&dst_name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        children.remove(&src_name);
+        children.insert(dst_name, node);
+        Ok(())
     }
 
     axfs_vfs::impl_vfs_dir_default! {}
